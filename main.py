@@ -510,8 +510,6 @@ class Scraper:
             return pages_written
         finally:
             writer.close()
-
-
 # -------------------------
 # Streamlit UI (optional)
 # -------------------------
@@ -520,10 +518,20 @@ def run_streamlit_app():
         print("Streamlit is not installed. Install with: pip install streamlit", file=sys.stderr)
         return
 
+    # Page config and branding
     st.set_page_config(page_title="Zain Crawler • RAG Builder", layout="wide")
     st.title("Zain Web Crawler & RAG Dataset Builder")
-    st.caption("Crawl websites professionally and export clean, chunked JSONL for RAG.")
+    st.caption("Crawl sites professionally and export clean, chunked JSONL for RAG.")
 
+    # Persist run data across reruns/tabs
+    if "records" not in st.session_state:
+        st.session_state.records = []
+    if "rag_lines" not in st.session_state:
+        st.session_state.rag_lines = []
+    if "run_summary" not in st.session_state:
+        st.session_state.run_summary = ""
+
+    # Sidebar: configuration
     with st.sidebar:
         st.header("Configuration")
         urls_text = st.text_area(
@@ -531,6 +539,7 @@ def run_streamlit_app():
             placeholder="One per line, e.g.\nhttps://example.com\nhttps://docs.example.com",
             height=110,
         )
+        url_file = st.file_uploader("Upload URL list (.txt or .csv)", type=["txt", "csv"], help="Each line or a 'url' column")
 
         st.subheader("Crawl Settings")
         same_domain = st.checkbox("Restrict to same domain(s)", value=True, help="Prevents cross-domain crawling")
@@ -542,56 +551,124 @@ def run_streamlit_app():
         follow_redirects = st.checkbox("Follow redirects", value=True)
         respect_robots = st.checkbox("Respect robots.txt", value=True)
 
-        st.subheader("Filters")
-        include_patterns = st.text_area("Include regex (optional)", placeholder=r"/docs|/blog", height=60)
-        exclude_patterns = st.text_area("Exclude regex (optional)", placeholder=r"\.pdf$|\?", height=60)
+        with st.expander("Filters", expanded=False):
+            include_patterns = st.text_area("Include regex (optional)", placeholder=r"/docs|/blog", height=60)
+            exclude_patterns = st.text_area("Exclude regex (optional)", placeholder=r"\.pdf$|\?", height=60)
 
-        st.subheader("Headers")
-        user_agent = st.text_input("User-Agent", value="zain-scraper/1.0")
+        with st.expander("Headers & RAG", expanded=False):
+            user_agent = st.text_input("User-Agent", value="zain-scraper/1.0")
+            chunk_size = st.slider("Chunk size (chars)", min_value=300, max_value=4000, value=1200, step=50)
+            chunk_overlap = st.slider("Chunk overlap (chars)", min_value=0, max_value=1000, value=150, step=10)
 
-        st.subheader("RAG Chunking")
-        chunk_size = st.slider("Chunk size (chars)", min_value=300, max_value=4000, value=1200, step=50)
-        chunk_overlap = st.slider("Chunk overlap (chars)", min_value=0, max_value=1000, value=150, step=10)
+        # Build candidate URL list for validation
+        uploaded_urls: List[str] = []
+        if url_file is not None:
+            try:
+                data = url_file.read().decode("utf-8", errors="ignore")
+                if url_file.name.lower().endswith(".csv"):
+                    reader = csv.DictReader(io.StringIO(data))
+                    if reader.fieldnames:
+                        cols_lower = [c.lower() for c in reader.fieldnames]
+                        if "url" in cols_lower:
+                            col = reader.fieldnames[cols_lower.index("url")]
+                        else:
+                            col = reader.fieldnames[0]
+                        for row in reader:
+                            val = (row.get(col) or "").strip()
+                            if val:
+                                uploaded_urls.append(val)
+                else:
+                    for line in data.splitlines():
+                        line = line.strip()
+                        if line:
+                            uploaded_urls.append(line)
+            except Exception:
+                st.warning("Could not parse uploaded file; falling back to text area only.")
+
+        typed_urls = [u.strip() for u in re.split(r"[\r\n,\s]+", urls_text or "") if u.strip()]
+        start_urls_all = typed_urls + uploaded_urls
+        valid_urls = [u for u in start_urls_all if is_http_like(u)]
+        invalid_urls = [u for u in start_urls_all if u and not is_http_like(u)]
+
+        st.caption(f"URLs: {len(valid_urls)} valid" + (f" • {len(invalid_urls)} invalid" if invalid_urls else ""))
+        if invalid_urls:
+            st.error("Invalid URLs detected (non-http/https). Fix them or they will be ignored.")
 
         st.markdown("---")
-        run_btn = st.button("Start Crawl", type="primary", use_container_width=True)
+        run_disabled = len(valid_urls) == 0
+        run_btn = st.button("Start Crawl", type="primary", use_container_width=True, disabled=run_disabled)
+        reset_btn = st.button("Reset Results", use_container_width=True)
 
-    # Main area
-    st.write("\n")
-    col_a, col_b, col_c, col_d = st.columns([1, 1, 1, 1])
-    with col_a:
-        st.metric("Max Pages", max_pages)
-    with col_b:
-        st.metric("Max Depth", max_depth)
-    with col_c:
-        st.metric("Concurrency", concurrency)
-    with col_d:
-        st.metric("Delay (s)", delay)
+    if reset_btn:
+        st.session_state.records = []
+        st.session_state.rag_lines = []
+        st.session_state.run_summary = ""
 
-    progress = st.progress(0)
-    status_placeholder = st.empty()
-    preview_placeholder = st.container()
-    download_placeholder = st.container()
+    # Tabs for a cleaner layout
+    t_crawl, t_results, t_downloads, t_about = st.tabs(["Crawl", "Results", "Downloads", "About"]) 
+
+    with t_crawl:
+        col_a, col_b, col_c, col_d = st.columns([1, 1, 1, 1])
+        with col_a:
+            st.metric("Max Pages", max_pages)
+        with col_b:
+            st.metric("Max Depth", max_depth)
+        with col_c:
+            st.metric("Concurrency", concurrency)
+        with col_d:
+            st.metric("Delay (s)", delay)
+        crawl_progress = st.progress(0)
+        crawl_status = st.empty()
+
+    with t_results:
+        results_placeholder = st.empty()
+        st.subheader("Preview: RAG JSONL (first 3 lines)")
+        preview_placeholder = st.container()
+
+    with t_downloads:
+        download_placeholder = st.container()
+
+    with t_about:
+        st.markdown("""
+        - Built for structured website crawling with retries, robots.txt, and filtering.
+        - Exports raw pages and RAG-friendly, chunked JSONL.
+        - Tip: Use Filters to keep only docs/blog paths and exclude binaries like PDFs.
+        """)
 
     if run_btn:
-        start_urls = [u.strip() for u in re.split(r"[\r\n,\s]+", urls_text or "") if u.strip()]
-        if not start_urls:
-            st.error("Please provide at least one valid HTTP/HTTPS URL.")
+        if not valid_urls:
+            st.warning("Please provide at least one valid HTTP/HTTPS URL.")
             st.stop()
 
-        include_list = [s for s in re.split(r"[\r\n]+", include_patterns or "") if s.strip()]
-        exclude_list = [s for s in re.split(r"[\r\n]+", exclude_patterns or "") if s.strip()]
+        include_list = [s for s in re.split(r"[\r\n]+", (include_patterns or "")) if s.strip()]
+        exclude_list = [s for s in re.split(r"[\r\n]+", (exclude_patterns or "")) if s.strip()]
 
-        records: List[Dict] = []
-        rag_lines: List[Dict] = []
+        st.session_state.records = []
+        st.session_state.rag_lines = []
 
         def on_record_cb(rec: Dict):
-            records.append(rec)
-            rag_lines.extend(build_rag_lines(rec, chunk_size=chunk_size, chunk_overlap=chunk_overlap))
-            # Update progress UI
-            pct = min(1.0, len(records) / float(max_pages))
-            progress.progress(int(pct * 100))
-            status_placeholder.info(f"Crawled {len(records)} / {max_pages} pages")
+            st.session_state.records.append(rec)
+            st.session_state.rag_lines.extend(
+                build_rag_lines(rec, chunk_size=int(chunk_size), chunk_overlap=int(chunk_overlap))
+            )
+            pct = min(1.0, len(st.session_state.records) / float(max_pages))
+            crawl_progress.progress(int(pct * 100))
+            crawl_status.info(f"Crawled {len(st.session_state.records)} / {max_pages} pages")
+            # Live table (last 100)
+            try:
+                results_placeholder.dataframe(
+                    [{
+                        "status": r.get("status"),
+                        "title": (r.get("title") or "")[:80],
+                        "url": r.get("requested_url"),
+                        "links": r.get("num_links"),
+                        "error": (r.get("error") or "")[:60],
+                    } for r in st.session_state.records[-100:]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            except Exception:
+                pass
 
         scraper = Scraper(
             user_agent=user_agent,
@@ -611,33 +688,32 @@ def run_streamlit_app():
         )
 
         t0 = time.time()
-        total = scraper.crawl(start_urls, on_record=on_record_cb)
+        total = scraper.crawl(valid_urls, on_record=on_record_cb)
         dt = time.time() - t0
-        progress.progress(100)
+        crawl_progress.progress(100)
+        st.session_state.run_summary = f"Finished. Pages written: {total} in {dt:.1f}s. RAG chunks: {len(st.session_state.rag_lines)}"
+        crawl_status.success(st.session_state.run_summary)
 
-        status_placeholder.success(f"Finished. Pages written: {total} in {dt:.1f}s. RAG chunks: {len(rag_lines)}")
-
-        # Preview
-        with preview_placeholder:
-            st.subheader("Preview: RAG JSONL (first 3 lines)")
-            preview_lines = [json.dumps(x, ensure_ascii=False) for x in rag_lines[:3]]
+        # Update preview
+        with t_results:
+            preview_lines = [json.dumps(x, ensure_ascii=False) for x in st.session_state.rag_lines[:3]]
             if preview_lines:
-                st.code("\n".join(preview_lines), language="json")
+                preview_placeholder.code("\n".join(preview_lines), language="json")
             else:
-                st.info("No preview available.")
+                preview_placeholder.info("No preview available.")
 
-        # Downloads
+        # Prepare downloads
         raw_buf = io.StringIO()
-        for rec in records:
+        for rec in st.session_state.records:
             raw_buf.write(json.dumps(rec, ensure_ascii=False) + "\n")
         raw_bytes = raw_buf.getvalue().encode("utf-8")
 
         rag_buf = io.StringIO()
-        for line in rag_lines:
+        for line in st.session_state.rag_lines:
             rag_buf.write(json.dumps(line, ensure_ascii=False) + "\n")
         rag_bytes = rag_buf.getvalue().encode("utf-8")
 
-        with download_placeholder:
+        with t_downloads:
             st.subheader("Download")
             c1, c2 = st.columns(2)
             with c1:
